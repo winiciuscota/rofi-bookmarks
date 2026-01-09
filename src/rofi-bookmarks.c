@@ -304,9 +304,9 @@ static unsigned int bookmarks_get_num_entries(const Mode *sw) {
     if (pd->edit_mode) {
         return 2; // Edit, Delete
     } else if (pd->settings_mode) {
-        return 2; // Purge, Import from Firefox
+        return 3; // Add Bookmark, Purge, Import from Firefox
     } else {
-        return pd->num_bookmarks + 2; // +1 for "Add Bookmark", +1 for "Settings"
+        return pd->num_bookmarks + 1; // +1 for "Settings"
     }
 }
 
@@ -355,21 +355,24 @@ static ModeMode bookmarks_result(Mode *sw, int mretv, char **input, unsigned int
     // Handle settings mode
     if (pd->settings_mode) {
         if (mretv & MENU_OK) {
-            if (selected_line == 0) { // Purge
-                char *helper = g_find_program_in_path("rofi-bookmarks-helper");
-                if (!helper) {
-                    helper = g_strdup("/usr/local/bin/rofi-bookmarks-helper");
-                }
+            char *helper = g_find_program_in_path("rofi-bookmarks-helper");
+            if (!helper) {
+                helper = g_strdup("/usr/local/bin/rofi-bookmarks-helper");
+            }
+            
+            if (selected_line == 0) { // Add Bookmark
+                char *cmd = g_strdup_printf("'%s' add", helper);
+                helper_execute_command(NULL, cmd, false, NULL);
+                g_free(cmd);
+                g_free(helper);
+                return MODE_EXIT;
+            } else if (selected_line == 1) { // Purge
                 char *cmd = g_strdup_printf("'%s' purge", helper);
                 helper_execute_command(NULL, cmd, false, NULL);
                 g_free(cmd);
                 g_free(helper);
                 return MODE_EXIT;
-            } else if (selected_line == 1) { // Import from Firefox
-                char *helper = g_find_program_in_path("rofi-bookmarks-helper");
-                if (!helper) {
-                    helper = g_strdup("/usr/local/bin/rofi-bookmarks-helper");
-                }
+            } else if (selected_line == 2) { // Import from Firefox
                 char *cmd = g_strdup_printf("'%s' import-firefox", helper);
                 helper_execute_command(NULL, cmd, false, NULL);
                 g_free(cmd);
@@ -383,32 +386,21 @@ static ModeMode bookmarks_result(Mode *sw, int mretv, char **input, unsigned int
     }
     
     // Handle kb-accept-alt (Shift+Return) in main mode - show edit/delete dialog
-    if (key == KEY_CUSTOM_ACTION && selected_line > 1) {
+    if (key == KEY_CUSTOM_ACTION && selected_line > 0) {
         pd->edit_mode = true;
-        pd->selected_bookmark_idx = selected_line - 2;
+        pd->selected_bookmark_idx = selected_line - 1;
         return RESET_DIALOG;
     }
     
     // Handle main mode - Enter key
     if (mretv & MENU_OK) {
         if (selected_line == 0) {
-            // Add Bookmark - launch helper script
-            char *helper = g_find_program_in_path("rofi-bookmarks-helper");
-            if (!helper) {
-                helper = g_strdup("/usr/local/bin/rofi-bookmarks-helper");
-            }
-            char *cmd = g_strdup_printf("'%s' add", helper);
-            helper_execute_command(NULL, cmd, false, NULL);
-            g_free(cmd);
-            g_free(helper);
-            return MODE_EXIT; // Exit so helper can relaunch
-        } else if (selected_line == 1) {
             // Open Settings submenu
             pd->settings_mode = true;
             return RESET_DIALOG;
         } else {
             // Open bookmark
-            int idx = selected_line - 2;
+            int idx = selected_line - 1;
             if (idx >= 0 && idx < pd->num_bookmarks) {
                 char *cmd = g_strdup_printf("xdg-open '%s'", pd->bookmarks[idx].url);
                 helper_execute_command(NULL, cmd, false, NULL);
@@ -431,15 +423,13 @@ static int bookmarks_token_match(const Mode *sw, rofi_int_matcher **tokens, unsi
         const char *options[] = {"Edit", "Delete"};
         return helper_token_match(tokens, options[index]);
     } else if (pd->settings_mode) {
-        const char *options[] = {"Purge All Bookmarks", "Import from Firefox"};
+        const char *options[] = {"Add Bookmark", "Purge All Bookmarks", "Import from Firefox"};
         return helper_token_match(tokens, options[index]);
     } else {
         if (index == 0) {
-            return helper_token_match(tokens, "Add Bookmark");
-        } else if (index == 1) {
-            return helper_token_match(tokens, "Bookmark Settings");
+            return helper_token_match(tokens, "Settings");
         } else {
-            return helper_token_match(tokens, pd->bookmarks[index - 2].name);
+            return helper_token_match(tokens, pd->bookmarks[index - 1].name);
         }
     }
 }
@@ -452,15 +442,13 @@ static char* bookmarks_get_display_value(const Mode *sw, unsigned int index, int
         const char *options[] = {"Edit", "Delete"};
         return get_entry ? g_strdup(options[index]) : NULL;
     } else if (pd->settings_mode) {
-        const char *options[] = {"🗑️ Purge All Bookmarks", "🦊 Import from Firefox"};
+        const char *options[] = {"➕ Add Bookmark", "🗑️ Purge All Bookmarks", "🦊 Import from Firefox"};
         return get_entry ? g_strdup(options[index]) : NULL;
     } else {
         if (index == 0) {
-            return get_entry ? g_strdup("➕ Add Bookmark") : NULL;
-        } else if (index == 1) {
-            return get_entry ? g_strdup("⚙️ Bookmark Settings") : NULL;
+            return get_entry ? g_strdup("⚙️ Settings") : NULL;
         } else {
-            int idx = index - 2;
+            int idx = index - 1;
             if (idx < pd->num_bookmarks) {
                 return get_entry ? g_strdup_printf("🔖 %s", pd->bookmarks[idx].name) : NULL;
             }
