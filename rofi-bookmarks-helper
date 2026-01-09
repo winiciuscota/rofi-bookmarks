@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Helper script for adding/editing bookmarks
+# This is called externally so rofi can prompt for input
+
+set -e
+
+ACTION="${1:-add}" # add or edit
+ENCRYPTED_FILE="$HOME/.local/share/rofi-bookmarks/bookmarks.gpg"
+TEMP_FILE=$(mktemp /tmp/rofi-bookmarks-XXXXXX)
+
+# Get password from rbw
+PASSWORD=$(rbw get Default 2>/dev/null || { echo "Failed to get password"; exit 1; })
+
+# Function to decrypt bookmarks
+decrypt() {
+    if [ -f "$ENCRYPTED_FILE" ]; then
+        echo "$PASSWORD" | gpg --batch --yes --passphrase-fd 0 --decrypt "$ENCRYPTED_FILE" > "$TEMP_FILE" 2>/dev/null
+    else
+        touch "$TEMP_FILE"
+    fi
+}
+
+# Function to encrypt bookmarks
+encrypt() {
+    mkdir -p "$(dirname "$ENCRYPTED_FILE")"
+    echo "$PASSWORD" | gpg --batch --yes --passphrase-fd 0 --symmetric --cipher-algo AES256 -o "$ENCRYPTED_FILE" "$TEMP_FILE" 2>/dev/null
+    shred -u "$TEMP_FILE" 2>/dev/null || rm -f "$TEMP_FILE"
+}
+
+if [ "$ACTION" = "add" ]; then
+    # Add new bookmark
+    NAME=$(rofi -dmenu -p "Bookmark name" -theme-str 'window {width: 50%;}')
+    [ -z "$NAME" ] && exit 0
+    
+    URL=$(rofi -dmenu -p "Bookmark URL" -theme-str 'window {width: 50%;}')
+    [ -z "$URL" ] && exit 0
+    
+    # Decrypt existing bookmarks
+    decrypt
+    
+    # Add new bookmark
+    echo "$NAME|$URL" >> "$TEMP_FILE"
+    
+    # Encrypt and cleanup
+    encrypt
+    
+    notify-send "Bookmark Added" "Added: $NAME"
+    
+elif [ "$ACTION" = "edit" ]; then
+    # Edit existing bookmark
+    BOOKMARK_NAME="$2"
+    
+    if [ -z "$BOOKMARK_NAME" ]; then
+        echo "Usage: $0 edit <bookmark_name>"
+        exit 1
+    fi
+    
+    # Decrypt bookmarks
+    decrypt
+    
+    # Find the bookmark
+    OLD_LINE=$(grep -F "|" "$TEMP_FILE" | grep -F "$BOOKMARK_NAME")
+    
+    if [ -z "$OLD_LINE" ]; then
+        echo "Bookmark not found"
+        shred -u "$TEMP_FILE" 2>/dev/null || rm -f "$TEMP_FILE"
+        exit 1
+    fi
+    
+    OLD_URL=$(echo "$OLD_LINE" | cut -d'|' -f2)
+    
+    # Get new values
+    NEW_NAME=$(echo "$BOOKMARK_NAME" | rofi -dmenu -p "Bookmark name" -theme-str 'window {width: 50%;}')
+    [ -z "$NEW_NAME" ] && { shred -u "$TEMP_FILE" 2>/dev/null || rm -f "$TEMP_FILE"; exit 0; }
+    
+    NEW_URL=$(echo "$OLD_URL" | rofi -dmenu -p "Bookmark URL" -theme-str 'window {width: 50%;}')
+    [ -z "$NEW_URL" ] && { shred -u "$TEMP_FILE" 2>/dev/null || rm -f "$TEMP_FILE"; exit 0; }
+    
+    # Replace bookmark
+    NEW_LINE="$NEW_NAME|$NEW_URL"
+    # Use awk to replace the line instead of sed for better handling of special chars
+    awk -v old="$OLD_LINE" -v new="$NEW_LINE" '{if ($0 == old) print new; else print}' "$TEMP_FILE" > "$TEMP_FILE.tmp"
+    mv "$TEMP_FILE.tmp" "$TEMP_FILE"
+    
+    # Encrypt and cleanup
+    encrypt
+    
+    notify-send "Bookmark Updated" "Updated: $NEW_NAME"
+fi
+
+# Relaunch rofi bookmarks
+rofi -show bookmarks

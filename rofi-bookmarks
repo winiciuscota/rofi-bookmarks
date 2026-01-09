@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+
+# rofi-bookmarks - A bookmark manager using rofi with encrypted storage
+# Password obtained from: rbw get Default
+
+set -euo pipefail
+
+# Configuration
+BOOKMARKS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/rofi-bookmarks"
+ENCRYPTED_FILE="$BOOKMARKS_DIR/bookmarks.gpg"
+TEMP_FILE=""
+
+# Ensure directory exists
+mkdir -p "$BOOKMARKS_DIR"
+
+# Cleanup function
+cleanup() {
+    if [[ -n "$TEMP_FILE" && -f "$TEMP_FILE" ]]; then
+        shred -u "$TEMP_FILE" 2>/dev/null || rm -f "$TEMP_FILE"
+    fi
+}
+trap cleanup EXIT
+
+# Get password from rbw
+get_password() {
+    rbw get Default
+}
+
+# Decrypt bookmarks file
+decrypt_bookmarks() {
+    TEMP_FILE=$(mktemp)
+    if [[ -f "$ENCRYPTED_FILE" ]]; then
+        get_password | gpg --batch --yes --passphrase-fd 0 --decrypt "$ENCRYPTED_FILE" > "$TEMP_FILE" 2>/dev/null || {
+            echo "" > "$TEMP_FILE"
+        }
+    else
+        touch "$TEMP_FILE"
+    fi
+}
+
+# Encrypt bookmarks file
+encrypt_bookmarks() {
+    get_password | gpg --batch --yes --passphrase-fd 0 --symmetric --cipher-algo AES256 -o "$ENCRYPTED_FILE" "$TEMP_FILE"
+}
+
+# Add bookmark
+add_bookmark() {
+    local name url
+    
+    # Get bookmark name
+    name=$(rofi -dmenu -p "Bookmark name" -theme-str 'window {width: 50%;}')
+    [[ -z "$name" ]] && return
+    
+    # Get bookmark URL
+    url=$(rofi -dmenu -p "Bookmark URL" -theme-str 'window {width: 50%;}')
+    [[ -z "$url" ]] && return
+    
+    # Add to temp file
+    echo "$name|$url" >> "$TEMP_FILE"
+    
+    # Encrypt and save
+    encrypt_bookmarks
+    
+    notify-send "Bookmark Added" "Added: $name"
+}
+
+# Edit bookmark
+edit_bookmark() {
+    local line="$1"
+    local name url new_name new_url
+    
+    IFS='|' read -r name url <<< "$line"
+    
+    # Get new name (pre-filled with current)
+    new_name=$(echo "$name" | rofi -dmenu -p "Bookmark name" -theme-str 'window {width: 50%;}')
+    [[ -z "$new_name" ]] && return
+    
+    # Get new URL (pre-filled with current)
+    new_url=$(echo "$url" | rofi -dmenu -p "Bookmark URL" -theme-str 'window {width: 50%;}')
+    [[ -z "$new_url" ]] && return
+    
+    # Replace in temp file
+    sed -i "s|^${name}|${url}\$|${new_name}|${new_url}|" "$TEMP_FILE"
+    
+    # Encrypt and save
+    encrypt_bookmarks
+    
+    notify-send "Bookmark Updated" "Updated: $new_name"
+}
+
+# Delete bookmark
+delete_bookmark() {
+    local line="$1"
+    local name url
+    
+    IFS='|' read -r name url <<< "$line"
+    
+    # Confirm deletion
+    local confirm
+    confirm=$(echo -e "Yes\nNo" | rofi -dmenu -p "Delete bookmark '$name'?" -theme-str 'window {width: 30%;}')
+    
+    if [[ "$confirm" == "Yes" ]]; then
+        # Remove from temp file
+        grep -v "^${name}|${url}\$" "$TEMP_FILE" > "$TEMP_FILE.tmp" || true
+        mv "$TEMP_FILE.tmp" "$TEMP_FILE"
+        
+        # Encrypt and save
+        encrypt_bookmarks
+        
+        notify-send "Bookmark Deleted" "Deleted: $name"
+    fi
+}
+
+# Show edit/delete menu for a bookmark
+show_bookmark_menu() {
+    local line="$1"
+    local name url
+    
+    IFS='|' read -r name url <<< "$line"
+    
+    local action
+    action=$(echo -e "Edit\nDelete\nOpen" | rofi -dmenu -p "Action for '$name'" -theme-str 'window {width: 30%;}')
+    
+    case "$action" in
+        Edit)
+            edit_bookmark "$line"
+            ;;
+        Delete)
+            delete_bookmark "$line"
+            ;;
+        Open)
+            xdg-open "$url" &
+            ;;
+    esac
+}
+
+# Main function
+main() {
+    # Decrypt bookmarks
+    decrypt_bookmarks
+    
+    # Prepare menu items
+    local items=""
+    items+="➕ Add Bookmark\n"
+    
+    # Add existing bookmarks
+    if [[ -s "$TEMP_FILE" ]]; then
+        while IFS='|' read -r name url; do
+            [[ -z "$name" ]] && continue
+            items+="🔖 $name\n"
+        done < "$TEMP_FILE"
+    fi
+    
+    # Show rofi menu with instructions
+    local selected
+    selected=$(echo -e "${items%\\n}" | rofi -dmenu -i \
+        -p "Bookmarks" \
+        -mesg "Enter: Open | Shift+Enter: Edit/Delete" \
+        -kb-accept-alt "" \
+        -kb-custom-1 "Shift+Return" \
+        -theme-str 'window {width: 50%;}')
+    
+    local exit_code=$?
+    
+    # Handle selection
+    # Exit code 0 = normal Enter
+    # Exit code 10 = kb-custom-1 (Shift+Enter)
+    if [[ $exit_code -eq 0 ]]; then
+        # Normal selection (Enter)
+        if [[ "$selected" == "➕ Add Bookmark" ]]; then
+            add_bookmark
+        else
+            # Open bookmark
+            local name="${selected#🔖 }"
+            local url
+            url=$(grep "^${name}|" "$TEMP_FILE" | cut -d'|' -f2)
+            [[ -n "$url" ]] && xdg-open "$url" &
+        fi
+    elif [[ $exit_code -eq 10 ]]; then
+        # kb-accept-alt (Shift+Return)
+        if [[ "$selected" != "➕ Add Bookmark" ]]; then
+            local name="${selected#🔖 }"
+            local line
+            line=$(grep "^${name}|" "$TEMP_FILE")
+            [[ -n "$line" ]] && show_bookmark_menu "$line"
+        fi
+    fi
+}
+
+main

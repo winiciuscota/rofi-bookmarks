@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+# Quick launcher for rofi-bookmarks
+rofi -show bookmarks

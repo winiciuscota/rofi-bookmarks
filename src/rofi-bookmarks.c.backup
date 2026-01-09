@@ -1,0 +1,488 @@
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <gmodule.h>
+#include <rofi/mode.h>
+#include <rofi/helper.h>
+#include <rofi/mode-private.h>
+
+G_MODULE_EXPORT Mode mode;
+
+// Bookmark structure
+typedef struct {
+    char *name;
+    char *url;
+} Bookmark;
+
+// Plugin private data
+typedef struct {
+    Bookmark *bookmarks;
+    int num_bookmarks;
+    int bookmark_capacity;
+    bool edit_mode;
+    bool input_mode;  // New: for getting user input
+    int input_step;   // 0=name, 1=url
+    char input_name[256];
+    char input_url[512];
+    int selected_bookmark_idx;
+    char *encrypted_file;
+    char *temp_file;
+} BookmarkModePrivateData;
+
+// Key types (from rofi-file-browser-extended)
+typedef enum {
+    KEY_CUSTOM_ACTION,
+    KEY_NONE
+} BMKey;
+
+// Get key from mretv (exactly like rofi-file-browser-extended)
+static BMKey get_key_from_mretv(int mretv) {
+    if (mretv & MENU_CUSTOM_ACTION) {
+        return KEY_CUSTOM_ACTION;
+    }
+    return KEY_NONE;
+}
+
+// Forward declarations
+static void load_bookmarks(BookmarkModePrivateData *pd);
+static void save_bookmarks(BookmarkModePrivateData *pd);
+static void decrypt_bookmarks(BookmarkModePrivateData *pd);
+static void encrypt_bookmarks(BookmarkModePrivateData *pd);
+static void add_bookmark(BookmarkModePrivateData *pd, const char *name, const char *url);
+static void edit_bookmark(BookmarkModePrivateData *pd, int index, const char *name, const char *url);
+static void delete_bookmark(BookmarkModePrivateData *pd, int index);
+static void cleanup_temp_file(BookmarkModePrivateData *pd);
+
+// Get password from rbw
+static char* get_password() {
+    FILE *fp = popen("rbw get Default 2>/dev/null", "r");
+    if (!fp) return NULL;
+    
+    char *password = g_malloc(256);
+    if (fgets(password, 256, fp) == NULL) {
+        g_free(password);
+        pclose(fp);
+        return NULL;
+    }
+    
+    // Remove newline
+    password[strcspn(password, "\n")] = 0;
+    pclose(fp);
+    return password;
+}
+
+// Decrypt bookmarks file
+static void decrypt_bookmarks(BookmarkModePrivateData *pd) {
+    pd->temp_file = g_strdup("/tmp/rofi-bookmarks-XXXXXX");
+    int fd = mkstemp(pd->temp_file);
+    if (fd == -1) {
+        pd->temp_file = NULL;
+        return;
+    }
+    close(fd);
+    
+    if (!g_file_test(pd->encrypted_file, G_FILE_TEST_EXISTS)) {
+        // Create empty file
+        FILE *fp = fopen(pd->temp_file, "w");
+        if (fp) fclose(fp);
+        return;
+    }
+    
+    char *password = get_password();
+    if (!password) return;
+    
+    char *cmd = g_strdup_printf("gpg --batch --yes --passphrase '%s' --decrypt '%s' > '%s' 2>/dev/null",
+                                password, pd->encrypted_file, pd->temp_file);
+    system(cmd);
+    
+    g_free(cmd);
+    memset(password, 0, strlen(password));
+    g_free(password);
+}
+
+// Encrypt bookmarks file
+static void encrypt_bookmarks(BookmarkModePrivateData *pd) {
+    if (!pd->temp_file) return;
+    
+    char *password = get_password();
+    if (!password) return;
+    
+    char *cmd = g_strdup_printf("gpg --batch --yes --passphrase '%s' --symmetric --cipher-algo AES256 -o '%s' '%s' 2>/dev/null",
+                                password, pd->encrypted_file, pd->temp_file);
+    system(cmd);
+    
+    g_free(cmd);
+    memset(password, 0, strlen(password));
+    g_free(password);
+}
+
+// Load bookmarks from decrypted temp file
+static void load_bookmarks(BookmarkModePrivateData *pd) {
+    if (!pd->temp_file || !g_file_test(pd->temp_file, G_FILE_TEST_EXISTS)) {
+        return;
+    }
+    
+    FILE *fp = fopen(pd->temp_file, "r");
+    if (!fp) return;
+    
+    char line[2048];
+    while (fgets(line, sizeof(line), fp)) {
+        // Remove newline
+        line[strcspn(line, "\n")] = 0;
+        
+        // Split by |
+        char *sep = strchr(line, '|');
+        if (!sep) continue;
+        
+        *sep = '\0';
+        char *name = line;
+        char *url = sep + 1;
+        
+        if (pd->num_bookmarks >= pd->bookmark_capacity) {
+            pd->bookmark_capacity = pd->bookmark_capacity == 0 ? 10 : pd->bookmark_capacity * 2;
+            pd->bookmarks = g_realloc(pd->bookmarks, pd->bookmark_capacity * sizeof(Bookmark));
+        }
+        
+        pd->bookmarks[pd->num_bookmarks].name = g_strdup(name);
+        pd->bookmarks[pd->num_bookmarks].url = g_strdup(url);
+        pd->num_bookmarks++;
+    }
+    
+    fclose(fp);
+}
+
+// Save bookmarks to temp file
+static void save_bookmarks(BookmarkModePrivateData *pd) {
+    if (!pd->temp_file) return;
+    
+    FILE *fp = fopen(pd->temp_file, "w");
+    if (!fp) return;
+    
+    for (int i = 0; i < pd->num_bookmarks; i++) {
+        fprintf(fp, "%s|%s\n", pd->bookmarks[i].name, pd->bookmarks[i].url);
+    }
+    
+    fclose(fp);
+}
+
+// Cleanup temp file
+static void cleanup_temp_file(BookmarkModePrivateData *pd) {
+    if (pd->temp_file) {
+        char *cmd = g_strdup_printf("shred -u '%s' 2>/dev/null || rm -f '%s'", 
+                                    pd->temp_file, pd->temp_file);
+        system(cmd);
+        g_free(cmd);
+        g_free(pd->temp_file);
+        pd->temp_file = NULL;
+    }
+}
+
+// Add bookmark via rofi prompt
+static void add_bookmark(BookmarkModePrivateData *pd, const char *name, const char *url) {
+    if (!name || !url || name[0] == '\0' || url[0] == '\0') return;
+    
+    // Add to bookmarks
+    if (pd->num_bookmarks >= pd->bookmark_capacity) {
+        pd->bookmark_capacity = pd->bookmark_capacity == 0 ? 10 : pd->bookmark_capacity * 2;
+        pd->bookmarks = g_realloc(pd->bookmarks, pd->bookmark_capacity * sizeof(Bookmark));
+    }
+    
+    pd->bookmarks[pd->num_bookmarks].name = g_strdup(name);
+    pd->bookmarks[pd->num_bookmarks].url = g_strdup(url);
+    pd->num_bookmarks++;
+    
+    // Save and encrypt
+    save_bookmarks(pd);
+    encrypt_bookmarks(pd);
+}
+
+// Edit bookmark
+static void edit_bookmark(BookmarkModePrivateData *pd, int index, const char *name, const char *url) {
+    if (index < 0 || index >= pd->num_bookmarks) return;
+    if (!name || !url || name[0] == '\0' || url[0] == '\0') return;
+    
+    Bookmark *bm = &pd->bookmarks[index];
+    
+    // Update bookmark
+    g_free(bm->name);
+    g_free(bm->url);
+    bm->name = g_strdup(name);
+    bm->url = g_strdup(url);
+    
+    // Save and encrypt
+    save_bookmarks(pd);
+    encrypt_bookmarks(pd);
+}
+
+// Delete bookmark
+static void delete_bookmark(BookmarkModePrivateData *pd, int index) {
+    if (index < 0 || index >= pd->num_bookmarks) return;
+    
+    // Confirm
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "echo -e 'Yes\\nNo' | rofi -dmenu -p 'Delete bookmark?' -theme-str 'window {width: 30%%;}' 2>/dev/null");
+    FILE *fp = popen(cmd, "r");
+    char confirm[10] = {0};
+    if (fp) {
+        fgets(confirm, sizeof(confirm), fp);
+        confirm[strcspn(confirm, "\n")] = 0;
+        pclose(fp);
+    }
+    
+    if (strcmp(confirm, "Yes") != 0) return;
+    
+    // Free bookmark
+    g_free(pd->bookmarks[index].name);
+    g_free(pd->bookmarks[index].url);
+    
+    // Shift bookmarks
+    for (int i = index; i < pd->num_bookmarks - 1; i++) {
+        pd->bookmarks[i] = pd->bookmarks[i + 1];
+    }
+    pd->num_bookmarks--;
+    
+    // Save and encrypt
+    save_bookmarks(pd);
+    encrypt_bookmarks(pd);
+}
+
+// ==================== Rofi Mode Implementation ====================
+
+static int bookmarks_init(Mode *sw) {
+    if (mode_get_private_data(sw) == NULL) {
+        BookmarkModePrivateData *pd = g_malloc0(sizeof(*pd));
+        mode_set_private_data(sw, (void *)pd);
+        
+        // Set encrypted file path
+        char *data_dir = g_build_filename(g_get_user_data_dir(), "rofi-bookmarks", NULL);
+        g_mkdir_with_parents(data_dir, 0700);
+        pd->encrypted_file = g_build_filename(data_dir, "bookmarks.gpg", NULL);
+        g_free(data_dir);
+        
+        pd->edit_mode = false;
+        pd->input_mode = false;
+        pd->input_step = 0;
+        pd->selected_bookmark_idx = -1;
+        
+        // Decrypt and load bookmarks
+        decrypt_bookmarks(pd);
+        load_bookmarks(pd);
+    }
+    
+    return true;
+}Cleanup
+    cleanup_temp_file(pd);
+    g_free(pd->encrypted_file);
+    g_free(pd);
+    
+    mode_set_private_data(sw, NULL);
+}
+
+static unsigned int bookmarks_get_num_entries(const Mode *sw) {
+    const Boinput_mode) {
+        return 0; // Input mode shows empty list for text entry
+    } else if (pd->edit_mode) {
+        return 2; // Edit, Delete
+    if (pd->edit_mode) {
+        return 3; // Edit, Delete, Open
+    } else {
+        return pd->num_bookmarks + 1; // +1 for "Add Bookmark"
+    }
+}
+
+static ModeMode bookmarks_result(Mode *sw, int mretv, char **input, unsigned int selected_line) {
+    BookmarkModePrivateData *pd = (BookmarkModePrivateData *)mode_get_private_data(sw);
+    BMKey key input mode for add/edit
+    if (pd->input_mode) {
+        if (mretv & MENU_OK || mretv & MENU_CUSTOM_INPUT) {
+            if (*input && (*input)[0] != '\0') {
+                if (pd->input_step == 0) {
+                    // Got name, now get URL
+                    strncpy(pd->input_name, *input, sizeof(pd->input_name) - 1);
+                    pd->input_step = 1;
+                    return RESET_DIALOG;
+                } else {
+                    // Got URL, complete the operation
+                    strncpy(pd->input_url, *input, sizeof(pd->input_url) - 1);
+                    
+                    if (pd->selected_bookmark_idx == -1) {
+                        // Adding new bookmark
+                        add_bookmark(pd, pd->input_name, pd->input_url);
+                    } else {
+                        // Editing existing bookmark
+                        edit_bookmark(pd, pd->selected_bookmark_idx, pd->input_name, pd->input_url);
+                    }
+                    
+                    // Reload bookmarks
+                    for (int i = 0; i < pd->num_bookmarks; i++) {
+                        g_free(pd->bookmarks[i].name);
+                        g_free(pd->bookmarks[i].url);
+                    }
+                    pd->num_bookmarks = 0;
+                    load_bookmarks(pd);
+                    
+                    pd->input_mode = false;
+                    pd->input_step = 0;
+                    pd->selected_bookmark_idx = -1;
+                    return RESET_DIALOG;
+                }
+            }
+        } else if (mretv & MENU_CANCEL) {
+            pd->input_mode = false;
+            pd->input_step = 0;
+            pd->selected_bookmark_idx = -1;
+            return RESET_DIALOG;
+        }
+        return RELOAD_DIALOG;
+    }
+    
+    // Handle edit mode
+    if (pd->edit_mode) {
+        if (mretv & MENU_OK) {
+            if (selected_line == 0) { // Edit
+                pd->edit_mode = false;
+                pd->input_mode = true;
+                pd->input_step = 0;
+                // Pre-fill with current values
+                if (pd->selected_bookmark_idx >= 0 && pd->selected_bookmark_idx < pd->num_bookmarks) {
+                    strncpy(pd->input_name, pd->bookmarks[pd->selected_bookmark_idx].name, sizeof(pd->input_name) - 1);
+                    strncpy(pd->input_url, pd->bookmarks[pd->selected_bookmark_idx].url, sizeof(pd->input_url) - 1);
+                }
+                return RESET_DIALOG;
+            } else if (selected_line == 1) { // Delete
+                delete_bookmark(pd, pd->selected_bookmark_idx);
+                // Reload bookmarks
+                for (int i = 0; i < pd->num_bookmarks; i++) {
+                    g_free(pd->bookmarks[i].name);
+                    g_free(pd->bookmarks[i].url);
+                }
+                pd->num_bookmarks = 0;
+                load_bookmarks(pd);
+                pd->edit_mode = false;
+                pd->selected_bookmark_idx = -1;
+                return RESET_DIALOG;
+            }
+        } else if (mretv & MENU_CANCEL) {
+            pd->edit_mode = false;
+            pd->selected_bookmark_idx = -1;
+            return RESET_DIALOG;
+        }
+    }
+    
+    // Handle kb-accept-alt (Shift+Return) in main mode - show edit/delete dialog
+    if (key == KEY_CUSTOM_ACTION && selected_line > 0) {
+        pd->input_mode) {
+        return true; // Accept any input
+    } else if (pd->edit_mode) {
+        const char *options[] = {"Edit", "Delete
+        return RESET_DIALOG;
+    }
+    
+    // Handle main mode - Enter key
+    if (mretv & MENU_OK) {
+        if (selected_line == 0) {
+            // Add Bookmark - enter input mode
+            pd->input_mode = true;
+            pd->input_step = 0;
+            pd->selected_bookmark_idx = -1
+            pd->num_bookmarks = 0;
+            load_bookmarks(pd);
+            return RESET_DIALOG;
+        } elinput_mode) {
+        return NULL; // No display items in input mode
+    } else if (pd->edit_mode) {
+        const char *options[] = {"Edit", "Delete
+            int idx = selected_line - 1;
+            if (idx >= 0 && idx < pd->num_bookmarks) {
+                char *cmd = g_strdup_printf("xdg-open '%s'", pd->bookmarks[idx].url);
+                helper_execute_command(NULL, cmd, false, NULL);
+                g_free(cmd);
+                return MODE_EXIT;
+            }
+        }
+    } else if (mretv & MENU_CANCEL) {
+        return MODE_EXIT;
+    }
+    
+    return RELOAD_DIALOG;
+}
+
+static int bookmarks_token_match(const Mode *sw, rofi_int_matcher **tokens, unsigned int index) {
+    const BookmarkModePrivateData *pd = (const BookmarkModePrivateData *)mode_get_private_data(sw);
+    
+    if (pd->edit_mode) {
+        const char *options[] = {"Edit", "Delete", "Open"};
+        return helper_token_match(tokens, options[index]);
+    } else {
+        if (index == 0) {
+            return helper_token_match(tokens, "Add Bookmark");
+        } else {
+            return helper_token_match(tokens, pd->bookmarks[index - 1].name);
+        }
+    }
+}
+
+static char* bookmarks_get_display_value(const Mode *sw, unsigned int index, int *state, G_GNUC_UNUSED GList **attr_list, int get_entry) {
+    const BookmarkModePrivateData *pd = (const BookmarkModePrivateData *)mode_get_private_data(sw);
+    
+    if (pd->edit_mode) {
+        const char *options[] = {"Edit", "Delete", "Open"};
+        return get_entry ? g_strdup(options[index]) : NULL;
+    } else {
+        if (index == 0) {
+            return get_entry ? g_strdup("➕ Add Bookmark") : NULL;
+        } else {
+            int idx = index - 1;
+            if (idx < pd->num_bookmarks) {
+                return get_entry ? g_strdup_printf("🔖 %s", pd->bookmarks[idx].name) : NULL;
+            }
+        }
+    }
+    
+    return NULL;
+}
+input_mode) {
+        if (pd->input_step == 0) {
+            if (pd->selected_bookmark_idx >= 0) {
+                return g_strdup_printf("Edit bookmark - Enter name (current: %s)", pd->input_name);
+            } else {
+                return g_strdup("Add bookmark - Enter name");
+            }
+        } else {
+            if (pd->selected_bookmark_idx >= 0) {
+                return g_strdup_printf("Edit bookmark - Enter URL (current: %s)", pd->input_url);
+            } else {
+                return g_strdup("Add bookmark - Enter URL");
+            }
+        }
+    } else if (pd->
+static char* bookmarks_get_message(const Mode *sw) {
+    const BookmarkModePrivateData *pd = (const BookmarkModePrivateData *)mode_get_private_data(sw);
+    
+    if (pd->edit_mode) {
+        return g_strdup("Select action");
+    } else {
+        return g_strdup("Enter: Open | Shift+Enter: Edit/Delete");
+    }
+}
+
+// Mode definition
+Mode mode = {
+    .abi_version        = ABI_VERSION,
+    .name               = "bookmarks",
+    .cfg_name_key       = "display-bookmarks",
+    ._init              = bookmarks_init,
+    ._get_num_entries   = bookmarks_get_num_entries,
+    ._result            = bookmarks_result,
+    ._destroy           = bookmarks_destroy,
+    ._token_match       = bookmarks_token_match,
+    ._get_display_value = bookmarks_get_display_value,
+    ._get_icon          = NULL,
+    ._get_completion    = NULL,
+    ._preprocess_input  = NULL,
+    ._get_message       = bookmarks_get_message,
+    .private_data       = NULL,
+    .free               = NULL,
+};
