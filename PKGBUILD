@@ -1,18 +1,18 @@
-# Maintainer: Your Name <your.email@example.com>
+# Maintainer: Winicius Cota <winiciuscota@github>
 pkgname=rofi-bookmarks
 pkgver=1.0.0
 pkgrel=1
-pkgdesc="Browser bookmarks plugin for rofi"
+pkgdesc="Encrypted bookmarks manager plugin for rofi"
 arch=('x86_64')
-url="https://github.com/yourusername/rofi-bookmarks"
+url="https://github.com/winiciuscota/rofi-bookmarks"
 license=('MIT')
-depends=('rofi' 'redis' 'xdg-utils')
-makedepends=('cmake' 'gcc')
-source=()
-md5sums=()
+depends=('rofi' 'rbw' 'gnupg' 'xdg-utils')
+makedepends=('cmake' 'gcc' 'git')
+source=("${pkgname}::git+https://github.com/winiciuscota/rofi-bookmarks.git")
+md5sums=('SKIP')
 
 build() {
-    cd "$startdir"
+    cd "$pkgname"
     mkdir -p build
     cd build
     cmake ..
@@ -20,21 +20,16 @@ build() {
 }
 
 package() {
-    cd "$startdir/build"
+    cd "$pkgname/build"
     
     # Install the plugin
     install -Dm755 bookmarks.so "$pkgdir/usr/lib/rofi/bookmarks.so"
     
-    # Install the helper script
-    install -Dm755 "$startdir/rofi-bookmarks-helper" "$pkgdir/usr/local/bin/rofi-bookmarks-helper"
+    # Install scripts
+    install -Dm755 "$srcdir/$pkgname/rofi-bookmarks-helper" "$pkgdir/usr/local/bin/rofi-bookmarks-helper"
+    install -Dm755 "$srcdir/$pkgname/rofi-bookmarks-launcher" "$pkgdir/usr/local/bin/rofi-bookmarks-launcher"
     
-    # Install launcher if it exists
-    if [ -f "$startdir/rofi-bookmarks-launcher" ]; then
-        install -Dm755 "$startdir/rofi-bookmarks-launcher" "$pkgdir/usr/local/bin/rofi-bookmarks-launcher"
-    fi
-    
-    # Install README if it exists
-    if [ -f "$startdir/README.md" ]; then
-        install -Dm644 "$startdir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
-    fi
+    # Install docs
+    install -Dm644 "$srcdir/$pkgname/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 "$srcdir/$pkgname/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
