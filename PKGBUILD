@@ -6,10 +6,10 @@ pkgdesc="Encrypted bookmarks manager plugin for rofi"
 arch=('x86_64')
 url="https://github.com/winiciuscota/rofi-bookmarks"
 license=('MIT')
-depends=('rofi' 'rbw' 'gnupg' 'xdg-utils')
+depends=('rofi' 'rbw' 'gnupg' 'xdg-utils' 'bash' 'coreutils')
 makedepends=('cmake' 'gcc' 'git')
-source=("${pkgname}::git+https://github.com/winiciuscota/rofi-bookmarks.git")
-md5sums=('SKIP')
+source=("${pkgname}::git+https://github.com/winiciuscota/rofi-bookmarks.git#tag=v${pkgver}")
+sha256sums=('SKIP')
 
 build() {
     cd "$pkgname"
