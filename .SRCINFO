@@ -1,0 +1,20 @@
+pkgbase = rofi-bookmarks
+	pkgdesc = Encrypted bookmarks manager plugin for rofi
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/winiciuscota/rofi-bookmarks
+	arch = x86_64
+	license = MIT
+	makedepends = cmake
+	makedepends = gcc
+	makedepends = git
+	depends = rofi
+	depends = rbw
+	depends = gnupg
+	depends = xdg-utils
+	depends = bash
+	depends = coreutils
+	source = rofi-bookmarks::git+https://github.com/winiciuscota/rofi-bookmarks.git#tag=v1.0.0
+	sha256sums = SKIP
+
+pkgname = rofi-bookmarks
