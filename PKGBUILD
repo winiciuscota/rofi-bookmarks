@@ -18,11 +18,8 @@ build() {
 package() {
     cd "$srcdir/rofi-bookmarks-src"
 
-    # Install main script
-    install -Dm755 rofi-bookmarks         "$pkgdir/usr/local/bin/rofi-bookmarks"
-    install -Dm755 rofi-bookmarks-launcher "$pkgdir/usr/local/bin/rofi-bookmarks-launcher"
+    install -Dm755 rofi-bookmarks "$pkgdir/usr/local/bin/rofi-bookmarks"
 
-    # Install docs
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 LICENSE   "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

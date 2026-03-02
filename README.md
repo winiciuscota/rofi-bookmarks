@@ -34,8 +34,7 @@ makepkg -si
 ### Manual
 
 ```bash
-install -Dm755 rofi-bookmarks         ~/.local/bin/rofi-bookmarks
-install -Dm755 rofi-bookmarks-launcher ~/.local/bin/rofi-bookmarks-launcher
+install -Dm755 rofi-bookmarks ~/.local/bin/rofi-bookmarks
 ```
 
 ## Usage
@@ -67,10 +66,9 @@ Select a bookmark and press `Shift+Enter`, then choose **Update** or **Delete**.
 ## File structure
 
 ```
-rofi-bookmarks        — main bash+python script
-rofi-bookmarks-launcher — thin wrapper (exec rofi-bookmarks)
-PKGBUILD              — Arch Linux package
-LICENSE               — MIT
+rofi-bookmarks   — main bash+python script
+PKGBUILD         — Arch Linux package
+LICENSE          — MIT
 ```
 
 ## License
