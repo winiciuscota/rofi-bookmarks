@@ -1,12 +1,7 @@
-# Build artifacts
-build/
-*.so
-*.o
-*.a
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-Makefile
+# makepkg artifacts
+pkg/
+src/
+*.pkg.tar.zst
 
 # IDE and editor files
 .vscode/

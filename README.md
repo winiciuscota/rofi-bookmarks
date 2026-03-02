@@ -1,50 +1,29 @@
-# 🔖 Rofi Bookmarks Manager
+# rofi-bookmarks
 
-A secure bookmark manager using rofi plugin with GPG encrypted storage.
+Browse, add, update and delete Firefox bookmarks via rofi — no sync account required.
 
-## ✨ Features
+Reads directly from Firefox's local `places.sqlite` database.
 
-- 🔐 **Encrypted Storage**: Bookmarks stored in GPG-encrypted file (AES256)
-- 🔑 **Password from Bitwarden**: Encryption password automatically retrieved from `rbw get Default`
-- 📂 **Hierarchical Organization**: Organize bookmarks with folders (e.g., `Work > Projects > MyApp`)
-- ➕ **Easy Management**: Add, edit, delete bookmarks through intuitive rofi interface
-- 🚀 **Native Plugin**: Built as proper rofi plugin in C for performance
-- 🌐 **Browser Integration**: Opens URLs in your default browser
-- ��️ **Secure Deletion**: Temporary files are shredded after use
-- 🎯 **Intuitive UX**: 
-  - `Enter` to open bookmark
-  - `Shift+Enter` for edit/delete menu
-  - Inline "Add Bookmark" option
+## Features
 
-## 📋 Requirements
+- Reads from the most recently used Firefox profile (auto-detected)
+- Displays full folder path: `Folder > Subfolder > Bookmark`
+- `Enter` — open bookmark in default browser
+- `Shift+Enter` — edit or delete the selected bookmark
+- `⚙ Settings` entry — add new bookmarks
+- `Folder/Name` syntax — create nested folders under the Bookmarks Toolbar
+- Handles DB lock: closes Firefox, saves changes, relaunches
 
-- `rofi` (>= 1.6.1) - Menu system
-- `gpg` - GPG encryption
-- `rbw` - Bitwarden CLI client (for password retrieval)
-- `xdg-open` - Open URLs in default browser
-- `cmake` (>= 3.10) - Build system
-- `glib-2.0` - Development libraries
-- `cairo` - Graphics library
+## Requirements
 
-## 📦 Installation
+- `bash`
+- `python3` (stdlib only — `sqlite3`, `configparser`, `uuid`)
+- `rofi`
+- `firefox`
+- `xdg-utils`
+- `libnotify`
 
-### Prerequisites
-
-1. Ensure you have a password stored in rbw named "Default":
-   ```bash
-   rbw add Default
-   # Enter a strong encryption password when prompted
-   ```
-
-### Building from Source
-
-```bash
-cd rofi-bookmarks
-cmake .
-make
-sudo make install
-sudo install -m 755 rofi-bookmarks-helper /usr/local/bin/
-```
+## Installation
 
 ### Arch Linux (PKGBUILD)
 
@@ -52,101 +31,48 @@ sudo install -m 755 rofi-bookmarks-helper /usr/local/bin/
 makepkg -si
 ```
 
-## 🚀 Usage
-
-### Running the Plugin
+### Manual
 
 ```bash
-rofi -show bookmarks
+install -Dm755 rofi-bookmarks         ~/.local/bin/rofi-bookmarks
+install -Dm755 rofi-bookmarks-launcher ~/.local/bin/rofi-bookmarks-launcher
 ```
 
-Or use the launcher script:
-```bash
-./rofi-bookmarks-launcher
-```
-
-### Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `Enter` | Open bookmark or select option |
-| `Shift+Enter` | Show edit/delete menu |
-| `Esc` | Cancel/Exit |
-
-### Adding a Bookmark
-
-1. Select "➕ Add Bookmark" (first option)
-2. Enter the bookmark name
-   - Use `Folder > Name` for hierarchy
-   - Example: `Work > Projects > MyApp`
-3. Enter the bookmark URL
-
-### Editing a Bookmark
-
-1. Select a bookmark
-2. Press `Shift+Enter`
-3. Choose "Edit"
-4. Modify the name and/or URL
-
-### Deleting a Bookmark
-
-1. Select a bookmark
-2. Press `Shift+Enter`
-3. Choose "Delete"
-4. Confirm deletion
-
-## 📁 Data Storage
-
-Bookmarks are stored at:
-```
-~/.local/share/rofi-bookmarks/bookmarks.gpg
-```
-
-The file is only decrypted when needed and immediately re-encrypted after modification.
-
-## 🔒 Security
-
-- **Encryption**: AES256 via GPG symmetric encryption
-- **Password Storage**: Encryption key stored in Bitwarden (via rbw)
-- **Secure Cleanup**: Temporary decrypted files are shredded after use
-- **No Plain Text**: Bookmarks never stored unencrypted on disk
-
-### Security Workflow
-
-1. Plugin requests password from `rbw get Default`
-2. File is decrypted to temporary location
-3. User performs action (add/edit/delete)
-4. File is immediately re-encrypted
-5. Temporary file is securely shredded
-
-## 🗂️ File Structure
-
-```
-rofi-bookmarks/
-├── src/
-│   └── rofi-bookmarks-clean.c    # Main plugin source (C)
-├── rofi-bookmarks                # Standalone script version
-├── rofi-bookmarks-helper         # Helper for add/edit operations
-├── rofi-bookmarks-launcher       # Convenience launcher
-├── CMakeLists.txt               # Build configuration
-├── PKGBUILD                     # Arch Linux package
-├── README.md                    # This file
-└── LICENSE                      # MIT License
-```
-
-## 🗑️ Uninstall
+## Usage
 
 ```bash
-sudo rm $(pkg-config --variable=pluginsdir rofi)/bookmarks.so
-sudo rm /usr/local/bin/rofi-bookmarks-helper
+rofi-bookmarks
 ```
 
-## 📄 License
+Or bind `rofi-bookmarks` to a keyboard shortcut in your desktop environment.
 
-MIT License - see [LICENSE](LICENSE) file for details
+### Keyboard shortcuts
 
-## 🙏 Credits
+| Key            | Action                        |
+|----------------|-------------------------------|
+| `Enter`        | Open bookmark in browser      |
+| `Shift+Enter`  | Edit / Delete menu            |
+| `Esc`          | Cancel / go back              |
 
-- Built with [rofi](https://github.com/davatorium/rofi)
-- Uses [rbw](https://github.com/doy/rbw) for Bitwarden integration
-- Encryption via [GnuPG](https://gnupg.org/)
+### Adding a bookmark
+
+1. Select `⚙ Settings` → `➕ Add Bookmark`
+2. Enter name — use `Folder/Name` to place inside a toolbar folder
+3. Enter URL
+
+### Editing / deleting
+
+Select a bookmark and press `Shift+Enter`, then choose **Update** or **Delete**.
+
+## File structure
+
+```
+rofi-bookmarks        — main bash+python script
+rofi-bookmarks-launcher — thin wrapper (exec rofi-bookmarks)
+PKGBUILD              — Arch Linux package
+LICENSE               — MIT
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

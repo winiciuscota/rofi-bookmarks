@@ -1,190 +1,500 @@
 #!/usr/bin/env bash
-
-# rofi-bookmarks - A bookmark manager using rofi with encrypted storage
-# Password obtained from: rbw get Default
+# rofi-bookmarks — browse, add, update, and delete Firefox local bookmarks
+# Reads directly from Firefox's places.sqlite (no sync required)
 
 set -euo pipefail
 
-# Configuration
-BOOKMARKS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/rofi-bookmarks"
-ENCRYPTED_FILE="$BOOKMARKS_DIR/bookmarks.gpg"
-TEMP_FILE=""
+SOH=$'\x01'
 
-# Ensure directory exists
-mkdir -p "$BOOKMARKS_DIR"
+##############################################################################
+# Find the most recently used Firefox profile (by places.sqlite mtime)
+##############################################################################
+find_firefox_profile() {
+    python3 - <<'EOF'
+import configparser, os, sys
 
-# Cleanup function
-cleanup() {
-    if [[ -n "$TEMP_FILE" && -f "$TEMP_FILE" ]]; then
-        shred -u "$TEMP_FILE" 2>/dev/null || rm -f "$TEMP_FILE"
+prof_dir = os.path.expanduser("~/.mozilla/firefox")
+if not os.path.isdir(prof_dir):
+    sys.exit("No Firefox profile directory found")
+
+ini = configparser.ConfigParser()
+ini.read(os.path.join(prof_dir, "profiles.ini"))
+
+best = None
+best_mtime = -1
+
+for section in ini.sections():
+    if not ini.has_option(section, "Path"):
+        continue
+    path = ini.get(section, "Path")
+    if not os.path.isabs(path):
+        path = os.path.join(prof_dir, path)
+    db = os.path.join(path, "places.sqlite")
+    if os.path.isfile(db):
+        m = os.path.getmtime(db)
+        if m > best_mtime:
+            best_mtime = m
+            best = path
+
+if best is None:
+    sys.exit("No Firefox places.sqlite found")
+print(best)
+EOF
+}
+
+##############################################################################
+# Build display list from a read-only sqlite copy
+# Output lines: "🔖 [Folder > ]Title\x01URL\x01Title\x01ID"
+##############################################################################
+build_display_list() {
+    local tmp_db="$1"
+    python3 - "$tmp_db" <<'EOF'
+import sqlite3, sys
+
+db = sys.argv[1]
+SOH = "\x01"
+ROOT_GUIDS = {"root________", "menu________", "toolbar_____",
+              "tags________", "unfiled_____", "mobile______"}
+
+con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+cur = con.cursor()
+
+# id → (title, parent_id) for folders
+folders = {}
+cur.execute("SELECT id, title, parent FROM moz_bookmarks WHERE type=2")
+for row in cur.fetchall():
+    folders[row[0]] = (row[1] or "", row[2])
+
+# Build human-readable folder path for a bookmark's parent id
+def folder_path(fid):
+    parts = []
+    visited = set()
+    while fid and fid not in visited:
+        visited.add(fid)
+        info = folders.get(fid)
+        if info is None:
+            break
+        title, parent = info
+        cur2 = con.cursor()
+        cur2.execute("SELECT guid FROM moz_bookmarks WHERE id=?", (fid,))
+        row = cur2.fetchone()
+        if row and row[0] in ROOT_GUIDS:
+            break
+        if title:
+            parts.append(title)
+        fid = parent
+    parts.reverse()
+    return " > ".join(parts)
+
+cur.execute("""
+    SELECT b.id, b.title, p.url, b.parent
+    FROM moz_bookmarks b
+    JOIN moz_places p ON b.fk = p.id
+    WHERE b.type = 1
+    ORDER BY b.lastModified DESC
+""")
+for bm_id, title, url, parent in cur.fetchall():
+    title = title or url or "(no title)"
+    path = folder_path(parent)
+    display = f"🔖 {path} > {title}" if path else f"🔖 {title}"
+    print(f"{display}{SOH}{url}{SOH}{title}{SOH}{bm_id}")
+
+con.close()
+EOF
+}
+
+##############################################################################
+# Run a Python write operation. On rc=2 (DB locked by Firefox), offer to
+# close Firefox, retry, then relaunch it.
+##############################################################################
+run_db_write() {
+    local rc=0
+    "$@" || rc=$?
+
+    if [[ $rc -eq 2 ]]; then
+        local confirm
+        confirm=$(printf 'Yes\nNo' | rofi -dmenu \
+            -p "Firefox must be closed to save changes. Close it now?" \
+            -mesg "Firefox will be relaunched automatically after the operation." \
+            -no-custom \
+            -theme-str 'window {width: 55%;}') || return 1
+        [[ "$confirm" != "Yes" ]] && return 1
+
+        local was_running=0
+        pgrep -x firefox >/dev/null 2>&1    && was_running=1
+        pgrep -x firefox-bin >/dev/null 2>&1 && was_running=1
+
+        pkill -x firefox     2>/dev/null || true
+        pkill -x firefox-bin 2>/dev/null || true
+
+        local i=0
+        while pgrep -x firefox >/dev/null 2>&1 || pgrep -x firefox-bin >/dev/null 2>&1; do
+            sleep 0.5
+            (( i++ )) || true
+            [[ $i -ge 20 ]] && break
+        done
+
+        rc=0
+        "$@" || rc=$?
+
+        [[ $was_running -eq 1 ]] && firefox &>/dev/null &
     fi
-}
-trap cleanup EXIT
-
-# Get password from rbw
-get_password() {
-    rbw get Default
+    return $rc
 }
 
-# Decrypt bookmarks file
-decrypt_bookmarks() {
-    TEMP_FILE=$(mktemp)
-    if [[ -f "$ENCRYPTED_FILE" ]]; then
-        get_password | gpg --batch --yes --passphrase-fd 0 --decrypt "$ENCRYPTED_FILE" > "$TEMP_FILE" 2>/dev/null || {
-            echo "" > "$TEMP_FILE"
-        }
-    else
-        touch "$TEMP_FILE"
-    fi
-}
-
-# Encrypt bookmarks file
-encrypt_bookmarks() {
-    get_password | gpg --batch --yes --passphrase-fd 0 --symmetric --cipher-algo AES256 -o "$ENCRYPTED_FILE" "$TEMP_FILE"
-}
-
+##############################################################################
 # Add bookmark
-add_bookmark() {
-    local name url
-    
-    # Get bookmark name
-    name=$(rofi -dmenu -p "Bookmark name" -theme-str 'window {width: 50%;}')
-    [[ -z "$name" ]] && return
-    
-    # Get bookmark URL
-    url=$(rofi -dmenu -p "Bookmark URL" -theme-str 'window {width: 50%;}')
-    [[ -z "$url" ]] && return
-    
-    # Add to temp file
-    echo "$name|$url" >> "$TEMP_FILE"
-    
-    # Encrypt and save
-    encrypt_bookmarks
-    
-    notify-send "Bookmark Added" "Added: $name"
+##############################################################################
+do_add_bookmark() {
+    local places_db="$1"
+
+    local name
+    name=$(rofi -dmenu \
+        -p "Bookmark name" \
+        -mesg "Tip: use 'Folder/Name' to place under a toolbar folder" \
+        -theme-str 'window {width: 55%;}') || return 0
+    [[ -z "$name" ]] && return 0
+
+    local url
+    url=$(rofi -dmenu \
+        -p "URL" \
+        -mesg "Enter the full URL (e.g. https://example.com)" \
+        -theme-str 'window {width: 55%;}') || return 0
+    [[ -z "$url" ]] && return 0
+
+    run_db_write python3 - "$places_db" "$name" "$url" <<'EOF'
+import sqlite3, sys, time, uuid
+
+db, name, url = sys.argv[1], sys.argv[2], sys.argv[3]
+TOOLBAR_GUID = "toolbar_____"
+
+def url_hash(u):
+    h = 0
+    for b in u.encode("utf-8"):
+        h = (h * 31 + b) & 0x00FFFFFFFFFFFFFF
+    return h
+
+try:
+    con = sqlite3.connect(db)
+    cur = con.cursor()
+
+    cur.execute("SELECT id FROM moz_bookmarks WHERE guid=?", (TOOLBAR_GUID,))
+    row = cur.fetchone()
+    if not row:
+        sys.exit("Toolbar folder not found")
+    toolbar_id = row[0]
+
+    def get_or_create_folder(parent_id, folder_name):
+        cur.execute(
+            "SELECT id FROM moz_bookmarks WHERE type=2 AND parent=? AND title=?",
+            (parent_id, folder_name))
+        row = cur.fetchone()
+        if row:
+            return row[0]
+        now = int(time.time() * 1_000_000)
+        cur.execute("SELECT MAX(position) FROM moz_bookmarks WHERE parent=?", (parent_id,))
+        pos = (cur.fetchone()[0] or 0) + 1
+        folder_guid = str(uuid.uuid4()).replace("-", "")[:12]
+        cur.execute(
+            "INSERT INTO moz_bookmarks (type, parent, position, title, dateAdded, lastModified, guid) "
+            "VALUES (2, ?, ?, ?, ?, ?, ?)",
+            (parent_id, pos, folder_name, now, now, folder_guid))
+        return cur.lastrowid
+
+    parts = name.split("/")
+    title = parts[-1].strip()
+    folder_parts = [p.strip() for p in parts[:-1] if p.strip()]
+
+    parent_id = toolbar_id
+    for fp in folder_parts:
+        parent_id = get_or_create_folder(parent_id, fp)
+
+    uh = url_hash(url)
+    cur.execute("SELECT id FROM moz_places WHERE url=?", (url,))
+    place_row = cur.fetchone()
+    if place_row:
+        place_id = place_row[0]
+    else:
+        cur.execute(
+            "INSERT INTO moz_places (url, url_hash, hidden, visit_count) VALUES (?, ?, 0, 0)",
+            (url, uh))
+        place_id = cur.lastrowid
+
+    now = int(time.time() * 1_000_000)
+    cur.execute("SELECT MAX(position) FROM moz_bookmarks WHERE parent=?", (parent_id,))
+    pos = (cur.fetchone()[0] or 0) + 1
+    bm_guid = str(uuid.uuid4()).replace("-", "")[:12]
+    cur.execute(
+        "INSERT INTO moz_bookmarks (type, fk, parent, position, title, dateAdded, lastModified, guid) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
+        (place_id, parent_id, pos, title, now, now, bm_guid))
+
+    con.commit()
+    con.close()
+    sys.exit(0)
+except Exception as e:
+    if "locked" in str(e).lower() or "readonly" in str(e).lower():
+        sys.exit(2)
+    sys.stderr.write(f"Error: {e}\n")
+    sys.exit(1)
+EOF
+
+    local rc=$?
+    [[ $rc -eq 0 ]] && notify-send "Bookmark Added" "Added: $name"
+    return $rc
 }
 
-# Edit bookmark
-edit_bookmark() {
-    local line="$1"
-    local name url new_name new_url
-    
-    IFS='|' read -r name url <<< "$line"
-    
-    # Get new name (pre-filled with current)
-    new_name=$(echo "$name" | rofi -dmenu -p "Bookmark name" -theme-str 'window {width: 50%;}')
-    [[ -z "$new_name" ]] && return
-    
-    # Get new URL (pre-filled with current)
-    new_url=$(echo "$url" | rofi -dmenu -p "Bookmark URL" -theme-str 'window {width: 50%;}')
-    [[ -z "$new_url" ]] && return
-    
-    # Replace in temp file
-    sed -i "s|^${name}|${url}\$|${new_name}|${new_url}|" "$TEMP_FILE"
-    
-    # Encrypt and save
-    encrypt_bookmarks
-    
-    notify-send "Bookmark Updated" "Updated: $new_name"
+##############################################################################
+# Update bookmark
+##############################################################################
+do_update_bookmark() {
+    local bm_id="$1" old_title="$2" old_url="$3" places_db="$4"
+
+    local new_title
+    new_title=$(rofi -dmenu \
+        -p "Title" \
+        -filter "$old_title" \
+        -mesg "Edit bookmark title (Esc to cancel)" \
+        -theme-str 'window {width: 55%;}') || return 0
+    [[ -z "$new_title" ]] && return 0
+
+    local new_url
+    new_url=$(rofi -dmenu \
+        -p "URL" \
+        -filter "$old_url" \
+        -mesg "Edit bookmark URL (Esc to cancel)" \
+        -theme-str 'window {width: 55%;}') || return 0
+    [[ -z "$new_url" ]] && return 0
+
+    run_db_write python3 - "$places_db" "$bm_id" "$new_title" "$new_url" <<'EOF'
+import sqlite3, sys, time
+
+db, bm_id, new_title, new_url = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+
+def url_hash(u):
+    h = 0
+    for b in u.encode("utf-8"):
+        h = (h * 31 + b) & 0x00FFFFFFFFFFFFFF
+    return h
+
+try:
+    con = sqlite3.connect(db)
+    cur = con.cursor()
+
+    cur.execute("SELECT fk FROM moz_bookmarks WHERE id=?", (bm_id,))
+    row = cur.fetchone()
+    if not row:
+        sys.exit("Bookmark not found")
+    place_id = row[0]
+
+    now = int(time.time() * 1_000_000)
+    cur.execute("UPDATE moz_bookmarks SET title=?, lastModified=? WHERE id=?",
+                (new_title, now, bm_id))
+    cur.execute("UPDATE moz_places SET url=?, url_hash=? WHERE id=?",
+                (new_url, url_hash(new_url), place_id))
+
+    con.commit()
+    con.close()
+    sys.exit(0)
+except Exception as e:
+    if "locked" in str(e).lower() or "readonly" in str(e).lower():
+        sys.exit(2)
+    sys.stderr.write(f"Error: {e}\n")
+    sys.exit(1)
+EOF
+
+    local rc=$?
+    [[ $rc -eq 0 ]] && notify-send "Bookmark Updated" "Updated: $new_title"
+    return $rc
 }
 
-# Delete bookmark
-delete_bookmark() {
-    local line="$1"
-    local name url
-    
-    IFS='|' read -r name url <<< "$line"
-    
-    # Confirm deletion
+##############################################################################
+# Delete bookmark + clean up empty parent folders
+##############################################################################
+do_delete_bookmark() {
+    local bm_id="$1" title="$2" places_db="$3"
+
     local confirm
-    confirm=$(echo -e "Yes\nNo" | rofi -dmenu -p "Delete bookmark '$name'?" -theme-str 'window {width: 30%;}')
-    
-    if [[ "$confirm" == "Yes" ]]; then
-        # Remove from temp file
-        grep -v "^${name}|${url}\$" "$TEMP_FILE" > "$TEMP_FILE.tmp" || true
-        mv "$TEMP_FILE.tmp" "$TEMP_FILE"
-        
-        # Encrypt and save
-        encrypt_bookmarks
-        
-        notify-send "Bookmark Deleted" "Deleted: $name"
-    fi
+    confirm=$(printf 'Yes\nNo' | rofi -dmenu \
+        -p "Delete '$title'?" \
+        -no-custom \
+        -theme-str 'window {width: 40%;}') || return 0
+    [[ "$confirm" != "Yes" ]] && return 0
+
+    run_db_write python3 - "$places_db" "$bm_id" <<'EOF'
+import sqlite3, sys
+
+db, bm_id = sys.argv[1], int(sys.argv[2])
+ROOT_GUIDS = {"root________", "menu________", "toolbar_____",
+              "tags________", "unfiled_____", "mobile______"}
+
+try:
+    con = sqlite3.connect(db)
+    cur = con.cursor()
+
+    cur.execute("SELECT parent FROM moz_bookmarks WHERE id=?", (bm_id,))
+    row = cur.fetchone()
+    parent_id = row[0] if row else None
+
+    cur.execute("DELETE FROM moz_bookmarks WHERE id=?", (bm_id,))
+
+    # Walk up parent chain, removing empty non-root folders
+    while parent_id:
+        cur.execute("SELECT guid FROM moz_bookmarks WHERE id=?", (parent_id,))
+        guid_row = cur.fetchone()
+        if not guid_row or guid_row[0] in ROOT_GUIDS:
+            break
+        cur.execute("SELECT COUNT(*) FROM moz_bookmarks WHERE parent=?", (parent_id,))
+        if cur.fetchone()[0] > 0:
+            break
+        cur.execute("SELECT parent FROM moz_bookmarks WHERE id=?", (parent_id,))
+        next_row = cur.fetchone()
+        cur.execute("DELETE FROM moz_bookmarks WHERE id=?", (parent_id,))
+        parent_id = next_row[0] if next_row else None
+
+    con.commit()
+    con.close()
+    sys.exit(0)
+except Exception as e:
+    if "locked" in str(e).lower() or "readonly" in str(e).lower():
+        sys.exit(2)
+    sys.stderr.write(f"Error: {e}\n")
+    sys.exit(1)
+EOF
+
+    local rc=$?
+    [[ $rc -eq 0 ]] && notify-send "Bookmark Deleted" "Deleted: $title"
+    return $rc
 }
 
-# Show edit/delete menu for a bookmark
-show_bookmark_menu() {
-    local line="$1"
-    local name url
-    
-    IFS='|' read -r name url <<< "$line"
-    
-    local action
-    action=$(echo -e "Edit\nDelete\nOpen" | rofi -dmenu -p "Action for '$name'" -theme-str 'window {width: 30%;}')
-    
-    case "$action" in
-        Edit)
-            edit_bookmark "$line"
-            ;;
-        Delete)
-            delete_bookmark "$line"
-            ;;
-        Open)
-            xdg-open "$url" &
-            ;;
+##############################################################################
+# Settings submenu — returns 1 to signal "close after operation"
+##############################################################################
+show_settings() {
+    local places_db="$1"
+
+    while true; do
+        local selected_idx
+        selected_idx=$(printf '➕ Add Bookmark\n' | rofi -dmenu -i \
+            -p "Settings" \
+            -format "i" \
+            -no-custom \
+            -theme-str 'window {width: 45%;}') || return 0
+
+        case "$selected_idx" in
+            0)
+                do_add_bookmark "$places_db"
+                [[ $? -ne 0 ]] && return 1
+                ;;
+        esac
+    done
+}
+
+##############################################################################
+# Bookmark action submenu (Shift+Enter) — returns 1 on successful operation
+##############################################################################
+show_bookmark_actions() {
+    local bm_id="$1" title="$2" url="$3" places_db="$4"
+
+    local selected_idx
+    selected_idx=$(printf '✏ Update\n🗑 Delete\n' | rofi -dmenu -i \
+        -p "$title" \
+        -format "i" \
+        -no-custom \
+        -theme-str 'window {width: 45%;}') || return 0
+
+    case "$selected_idx" in
+        0) do_update_bookmark "$bm_id" "$title" "$url" "$places_db"; return $? ;;
+        1) do_delete_bookmark "$bm_id" "$title" "$places_db";         return $? ;;
     esac
+    return 0
 }
 
-# Main function
-main() {
-    # Decrypt bookmarks
-    decrypt_bookmarks
-    
-    # Prepare menu items
-    local items=""
-    items+="➕ Add Bookmark\n"
-    
-    # Add existing bookmarks
-    if [[ -s "$TEMP_FILE" ]]; then
-        while IFS='|' read -r name url; do
-            [[ -z "$name" ]] && continue
-            items+="🔖 $name\n"
-        done < "$TEMP_FILE"
-    fi
-    
-    # Show rofi menu with instructions
-    local selected
-    selected=$(echo -e "${items%\\n}" | rofi -dmenu -i \
+##############################################################################
+# Main menu — returns 0 to loop, 1 to exit
+##############################################################################
+show_main_menu() {
+    local places_db="$1" tmp_db="$2"
+
+    cp "$places_db" "$tmp_db"
+
+    local raw_entries=()
+    mapfile -t raw_entries < <(build_display_list "$tmp_db" 2>/dev/null || true)
+
+    local -a display_lines=() urls=() titles=() bm_ids=()
+    local SOH_char=$'\x01'
+    for entry in "${raw_entries[@]}"; do
+        [[ -z "$entry" ]] && continue
+        IFS="$SOH_char" read -r dl url title bm_id <<< "$entry"
+        display_lines+=("$dl")
+        urls+=("$url")
+        titles+=("$title")
+        bm_ids+=("$bm_id")
+    done
+
+    local rofi_input
+    rofi_input=$(printf '⚙ Settings\n'; printf '%s\n' "${display_lines[@]}")
+
+    local selected_idx="" rofi_exit=0
+    selected_idx=$(printf '%s' "$rofi_input" | rofi -dmenu -i \
         -p "Bookmarks" \
-        -mesg "Enter: Open | Shift+Enter: Edit/Delete" \
+        -mesg "Enter: Open  |  Shift+Enter: Edit / Delete" \
         -kb-accept-alt "" \
-        -kb-custom-1 "Shift+Return" \
-        -theme-str 'window {width: 50%;}')
-    
-    local exit_code=$?
-    
-    # Handle selection
-    # Exit code 0 = normal Enter
-    # Exit code 10 = kb-custom-1 (Shift+Enter)
-    if [[ $exit_code -eq 0 ]]; then
-        # Normal selection (Enter)
-        if [[ "$selected" == "➕ Add Bookmark" ]]; then
-            add_bookmark
-        else
-            # Open bookmark
-            local name="${selected#🔖 }"
-            local url
-            url=$(grep "^${name}|" "$TEMP_FILE" | cut -d'|' -f2)
-            [[ -n "$url" ]] && xdg-open "$url" &
-        fi
-    elif [[ $exit_code -eq 10 ]]; then
-        # kb-accept-alt (Shift+Return)
-        if [[ "$selected" != "➕ Add Bookmark" ]]; then
-            local name="${selected#🔖 }"
-            local line
-            line=$(grep "^${name}|" "$TEMP_FILE")
-            [[ -n "$line" ]] && show_bookmark_menu "$line"
-        fi
+        -kb-custom-1 "shift+Return" \
+        -format "i" \
+        -no-custom \
+        -theme-str 'window {width: 60%;}') || rofi_exit=$?
+
+    [[ $rofi_exit -eq 1 || -z "$selected_idx" ]] && return 1
+
+    if [[ "$selected_idx" -eq 0 ]]; then
+        show_settings "$places_db"
+        [[ $? -eq 1 ]] && return 1
+        return 0
     fi
+
+    local arr_idx=$(( selected_idx - 1 ))
+    [[ $arr_idx -lt 0 || $arr_idx -ge ${#bm_ids[@]} ]] && return 0
+
+    local sel_id="${bm_ids[$arr_idx]}"
+    local sel_url="${urls[$arr_idx]}"
+    local sel_title="${titles[$arr_idx]}"
+
+    if [[ $rofi_exit -eq 0 ]]; then
+        [[ -n "$sel_url" ]] && xdg-open "$sel_url" &>/dev/null &
+        return 1
+    elif [[ $rofi_exit -eq 10 ]]; then
+        show_bookmark_actions "$sel_id" "$sel_title" "$sel_url" "$places_db"
+        [[ $? -eq 1 ]] && return 1
+        return 0
+    fi
+
+    return 0
+}
+
+##############################################################################
+# Entry point
+##############################################################################
+main() {
+    local profile_path
+    profile_path=$(find_firefox_profile) || {
+        notify-send -u critical "rofi-bookmarks" "Firefox profile not found"
+        exit 1
+    }
+
+    local places_db="$profile_path/places.sqlite"
+    [[ -f "$places_db" ]] || {
+        notify-send -u critical "rofi-bookmarks" "places.sqlite not found in $profile_path"
+        exit 1
+    }
+
+    local tmp_db
+    tmp_db=$(mktemp /tmp/rofi-bookmarks-XXXXXX.sqlite)
+    trap 'rm -f "$tmp_db"' EXIT
+
+    while show_main_menu "$places_db" "$tmp_db"; do
+        :
+    done
 }
 
 main
